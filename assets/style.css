@@ -1,0 +1,31 @@
+/* SubGEN AI — Custom Streamlit CSS overrides */
+
+/* Tighten sidebar padding */
+section[data-testid="stSidebar"] > div:first-child {
+    padding-top: 1rem;
+}
+
+/* Segment expander: RED tint */
+details[data-testid="stExpander"][data-label*="🔴"] summary {
+    background-color: rgba(255, 80, 80, 0.08);
+    border-left: 3px solid #e05;
+    border-radius: 4px;
+}
+
+/* Segment expander: GREEN tint */
+details[data-testid="stExpander"][data-label*="🟢"] summary {
+    background-color: rgba(0, 200, 100, 0.07);
+    border-left: 3px solid #0c6;
+    border-radius: 4px;
+}
+
+/* Primary button — slightly larger */
+button[kind="primary"] {
+    font-size: 1rem !important;
+    padding: 0.55rem 1.2rem !important;
+}
+
+/* Metric value — bolder */
+[data-testid="stMetricValue"] {
+    font-weight: 700;
+}

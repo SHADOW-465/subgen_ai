@@ -1,0 +1,20 @@
+# SubGEN AI — Python dependencies
+# Pin versions for reproducibility.
+#
+# System prerequisites (install separately — NOT via pip):
+#   ffmpeg binary:
+#     Ubuntu/Debian : sudo apt install ffmpeg
+#     macOS         : brew install ffmpeg
+#     Windows       : winget install ffmpeg   OR   scoop install ffmpeg
+#
+# Optional hardware:
+#   ESP32 DevKit v1 connected via USB serial.
+#   Flash firmware/esp32_firmware.ino using Arduino IDE + ArduinoJson v6.
+
+streamlit>=1.35.0
+faster-whisper>=1.0.0
+pyserial>=3.5
+numpy>=1.24.0
+scipy>=1.11.0
+ffmpeg-python>=0.2.0
+pandas>=1.5.0
