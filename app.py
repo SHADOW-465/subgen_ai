@@ -67,7 +67,6 @@ def _init_state() -> None:
         "filter_red_only": False, # bool — review tab filter
         "video_bytes": None,   # bytes | None — raw uploaded file for the player
         "video_ext":   "",     # str — e.g. ".mp4", ".avi"
-        "port_scan_done": False,  # bool — initial port scan completed
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -113,6 +112,26 @@ def _get_video_mime() -> str:
 # SIDEBAR
 # ────────────────────────────────────────────────────────────────────────────
 
+@st.fragment(run_every=2)
+def _hw_status_fragment() -> None:
+    """
+    Live hardware-status widget — auto-reruns every 2 s so plug/unplug is
+    reflected immediately without touching the rest of the page.
+    """
+    ports = find_all_esp32_ports()
+    if ports:
+        st.session_state["port"]      = ports[0]
+        st.session_state["hw_status"] = "connected"
+        st.success(f"Connected — {ports[0]}")
+    else:
+        st.session_state["port"]      = None
+        st.session_state["hw_status"] = "software"
+        st.warning("Not detected — software mode")
+
+    if st.button("↺ Reconnect", use_container_width=True):
+        st.rerun(scope="fragment")
+
+
 def render_sidebar() -> None:
     """Render the full left sidebar: hardware, AI settings, DB stats."""
     with st.sidebar:
@@ -122,89 +141,7 @@ def render_sidebar() -> None:
 
         # ── Hardware section ────────────────────────────────────────────────
         st.markdown("### ⚙ Hardware")
-
-        # --- Rescan button (always allow re-detection) ---
-        col_scan, col_manual = st.columns([1, 1])
-        with col_scan:
-            do_scan = st.button("🔍 Rescan Ports", use_container_width=True)
-        with col_manual:
-            manual_entry = st.toggle("✏ Enter manually",
-                                     value=st.session_state.get("manual_port_mode", False),
-                                     key="manual_port_mode")
-
-        # Auto-scan once on first load; only re-scan when button is clicked.
-        # This avoids the Bluetooth COM port slowdown blocking every re-render.
-        needs_scan = do_scan or not st.session_state.get("port_scan_done", False)
-        if needs_scan:
-            with st.spinner("🔎 Scanning serial ports…"):
-                detected_ports = find_all_esp32_ports()
-            st.session_state["esp32_ports"] = detected_ports
-            st.session_state["port_scan_done"] = True
-            if detected_ports:
-                # Only auto-set port if not already set to a valid detected port
-                if st.session_state.get("port") not in detected_ports:
-                    st.session_state["port"] = detected_ports[0]
-                st.session_state["hw_status"] = "connected"
-            else:
-                st.session_state["hw_status"] = "software"
-
-        # Manual port text input
-        if manual_entry:
-            manual_port = st.text_input(
-                "COM Port (e.g. COM3, /dev/ttyUSB0)",
-                value=st.session_state.get("port") or "",
-                placeholder="COM3",
-                key="manual_port_input",
-            ).strip()
-            if manual_port:
-                st.session_state["port"] = manual_port
-                st.session_state["hw_status"] = "connected"
-            else:
-                st.session_state["port"] = None
-                st.session_state["hw_status"] = "software"
-        else:
-            # Selectbox from auto-detected ports
-            port_options = st.session_state["esp32_ports"] + ["Software only"]
-            current_port = st.session_state.get("port") or "Software only"
-            default_idx = (
-                port_options.index(current_port)
-                if current_port in port_options
-                else len(port_options) - 1
-            )
-            selected_port = st.selectbox(
-                "ESP32 Port",
-                options=port_options,
-                index=default_idx,
-                key="port_select",
-            )
-            st.session_state["port"] = (
-                None if selected_port == "Software only" else selected_port
-            )
-
-        # Status indicator
-        hw_status = st.session_state["hw_status"]
-        active_port = st.session_state.get("port")
-        if active_port is not None:
-            st.markdown(f"🟢 **Connected** ({active_port}) — Hardware MFCC active")
-        elif hw_status == "error":
-            st.markdown("🔴 **Not found** — check USB cable / driver")
-        else:
-            st.markdown("🔵 **Software mode** — SW-MFCC fallback")
-
-        # Diagnostic expander — shows all available serial ports
-        with st.expander("🔎 All serial ports (diagnostics)", expanded=False):
-            all_ports = list_all_ports()
-            if not all_ports:
-                st.caption("No serial ports found on this machine.")
-            else:
-                for p in all_ports:
-                    vid_str = f"VID:{p['vid']:04X}" if p["vid"] else "VID:---"
-                    pid_str = f"PID:{p['pid']:04X}" if p["pid"] else "PID:---"
-                    st.code(
-                        f"{p['device']}  |  {p['description']}\n"
-                        f"{vid_str} {pid_str}  |  {p['hwid']}",
-                        language="text",
-                    )
+        _hw_status_fragment()
 
         st.divider()
 
@@ -226,17 +163,53 @@ def render_sidebar() -> None:
         )
         st.session_state["task"] = "translate" if task_choice == "Translate to English" else "transcribe"
 
-        language_options = [
-            "Auto-detect", "ta", "te", "hi", "ml", "kn", "mr",
-            "en", "zh", "ja", "ko", "fr", "de", "es", "pt", "ar",
-        ]
-        lang_sel = st.selectbox(
+        _LANG_DISPLAY = {
+            "af": "Afrikaans",       "am": "Amharic",          "ar": "Arabic",
+            "as": "Assamese",        "az": "Azerbaijani",      "ba": "Bashkir",
+            "be": "Belarusian",      "bg": "Bulgarian",        "bn": "Bengali",
+            "bo": "Tibetan",         "br": "Breton",           "bs": "Bosnian",
+            "ca": "Catalan",         "cs": "Czech",            "cy": "Welsh",
+            "da": "Danish",          "de": "German",           "el": "Greek",
+            "en": "English",         "es": "Spanish",          "et": "Estonian",
+            "eu": "Basque",          "fa": "Persian",          "fi": "Finnish",
+            "fo": "Faroese",         "fr": "French",           "gl": "Galician",
+            "gu": "Gujarati",        "ha": "Hausa",            "haw": "Hawaiian",
+            "he": "Hebrew",          "hi": "Hindi",            "hr": "Croatian",
+            "ht": "Haitian Creole",  "hu": "Hungarian",        "hy": "Armenian",
+            "id": "Indonesian",      "is": "Icelandic",        "it": "Italian",
+            "ja": "Japanese",        "jw": "Javanese",         "ka": "Georgian",
+            "kk": "Kazakh",          "km": "Khmer",            "kn": "Kannada",
+            "ko": "Korean",          "la": "Latin",            "lb": "Luxembourgish",
+            "ln": "Lingala",         "lo": "Lao",              "lt": "Lithuanian",
+            "lv": "Latvian",         "mg": "Malagasy",         "mi": "Maori",
+            "mk": "Macedonian",      "ml": "Malayalam",        "mn": "Mongolian",
+            "mr": "Marathi",         "ms": "Malay",            "mt": "Maltese",
+            "my": "Burmese",         "ne": "Nepali",           "nl": "Dutch",
+            "nn": "Nynorsk",         "no": "Norwegian",        "oc": "Occitan",
+            "pa": "Punjabi",         "pl": "Polish",           "ps": "Pashto",
+            "pt": "Portuguese",      "ro": "Romanian",         "ru": "Russian",
+            "sa": "Sanskrit",        "sd": "Sindhi",           "si": "Sinhala",
+            "sk": "Slovak",          "sl": "Slovenian",        "sn": "Shona",
+            "so": "Somali",          "sq": "Albanian",         "sr": "Serbian",
+            "su": "Sundanese",       "sv": "Swedish",          "sw": "Swahili",
+            "ta": "Tamil",           "te": "Telugu",           "tg": "Tajik",
+            "th": "Thai",            "tk": "Turkmen",          "tl": "Filipino",
+            "tr": "Turkish",         "tt": "Tatar",            "uk": "Ukrainian",
+            "ur": "Urdu",            "uz": "Uzbek",            "vi": "Vietnamese",
+            "yi": "Yiddish",         "yo": "Yoruba",           "yue": "Cantonese",
+            "zh": "Chinese",
+        }
+        _LANG_LABELS = ["Auto-detect"] + [f"{v} ({k})" for k, v in _LANG_DISPLAY.items()]
+        _LANG_CODES  = [None]          + list(_LANG_DISPLAY.keys())
+
+        lang_idx = st.selectbox(
             "Language",
-            options=language_options,
+            options=range(len(_LANG_LABELS)),
+            format_func=lambda i: _LANG_LABELS[i],
             index=0,
-            help="Select the spoken language, or Auto-detect.",
+            help="Type to search. Auto-detect works well for most languages.",
         )
-        st.session_state["language"] = None if lang_sel == "Auto-detect" else lang_sel
+        st.session_state["language"] = _LANG_CODES[lang_idx]
 
         st.divider()
 
@@ -318,61 +291,94 @@ def render_tab_upload() -> None:
 
 def _run_transcription(uploaded_file) -> None:
     """Save upload to temp file, run transcription pipeline, update session state."""
+    import time
     import numpy as np
+    from subgen_ai.core.transcriber import extract_audio as _extract_audio
 
-    # Capture raw bytes via getvalue() — works regardless of stream position.
-    # Done BEFORE the try block so bytes are saved even if transcription fails.
     raw_bytes = uploaded_file.getvalue()
     suffix    = Path(uploaded_file.name).suffix or ".mp4"
     st.session_state["video_bytes"] = raw_bytes
     st.session_state["video_ext"]   = suffix
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(raw_bytes)          # use raw_bytes, NOT uploaded_file.read()
+        tmp.write(raw_bytes)
         tmp_path = tmp.name
 
-    progress_bar = st.progress(0, text="⏳ Starting…")
-    status_text  = st.empty()
-
-    segments_acc: list[SubtitleSegment] = []
-
-    def _progress(i: int, total: int, seg: SubtitleSegment) -> None:
-        pct = int(i / max(total, 1) * 100)
-        progress_bar.progress(pct, text=f"🔄 Processing segment {i}/{total}…")
-        status_text.caption(
-            f"[{_fmt_time(seg.start)} → {_fmt_time(seg.end)}]  {seg.text[:60]}"
-        )
-        segments_acc.append(seg)
+    # ── UI placeholders ──────────────────────────────────────────────────────
+    step_status  = st.empty()
+    progress_bar = st.progress(0)
+    metrics_row  = st.empty()
+    seg_preview  = st.empty()
 
     try:
-        with st.spinner("Extracting audio and running ASR…"):
-            segments = transcribe(
-                video_path=tmp_path,
-                model_size=st.session_state.get("model_size", DEFAULT_MODEL),
-                language=st.session_state.get("language"),
-                task=st.session_state.get("task", "transcribe"),
-                esp32_port=st.session_state.get("port"),
-                progress_callback=_progress,
+        # ── Step 1: extract audio ────────────────────────────────────────────
+        step_status.info("Step 1 / 2 — Extracting audio from file…")
+        audio_arr, sr = _extract_audio(tmp_path)
+        total_dur = len(audio_arr) / sr
+
+        def _fmt_dur(s: float) -> str:
+            m, sec = divmod(int(s), 60)
+            h, m   = divmod(m, 60)
+            return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+        # ── Step 2: transcribe ───────────────────────────────────────────────
+        step_status.info("Step 2 / 2 — Generating subtitles…")
+        t_start    = time.time()
+        seg_count  = [0]
+
+        def _progress(i: int, total_duration: float, seg: SubtitleSegment) -> None:
+            seg_count[0] = i
+            elapsed  = time.time() - t_start
+            pct      = min(seg.end / max(total_duration, 1), 1.0)
+            eta_str  = (
+                f"~{_fmt_dur(elapsed / pct * (1.0 - pct))}"
+                if pct > 0.02 else "calculating…"
+            )
+            progress_bar.progress(pct)
+            metrics_row.markdown(
+                f"**{pct*100:.1f}%** complete &nbsp;|&nbsp; "
+                f"Segments: **{i}** &nbsp;|&nbsp; "
+                f"Elapsed: **{_fmt_dur(elapsed)}** &nbsp;|&nbsp; "
+                f"ETA: **{eta_str}** &nbsp;|&nbsp; "
+                f"Position: **{_fmt_dur(seg.end)}** / {_fmt_dur(total_duration)}"
+            )
+            label_icon = "🟢" if seg.label == "GREEN" else "🔴"
+            seg_preview.caption(
+                f"{label_icon} [{_fmt_time(seg.start)} → {_fmt_time(seg.end)}]  "
+                f"{seg.text[:80]}{'…' if len(seg.text) > 80 else ''}"
             )
 
-        # Also store the raw audio array for on-demand clip extraction
-        from subgen_ai.core.transcriber import extract_audio
-        audio_arr, sr = extract_audio(tmp_path)
-        st.session_state["audio"]    = audio_arr
-        st.session_state["sr"]       = sr
-        st.session_state["segments"] = segments
-        st.session_state["filename"] = uploaded_file.name
-        st.session_state["done"]     = True
+        segments = transcribe(
+            model_size=st.session_state.get("model_size", DEFAULT_MODEL),
+            language=st.session_state.get("language"),
+            task=st.session_state.get("task", "transcribe"),
+            esp32_port=st.session_state.get("port"),
+            progress_callback=_progress,
+            audio=audio_arr,
+            sr=sr,
+        )
+
+        st.session_state["audio"]            = audio_arr
+        st.session_state["sr"]               = sr
+        st.session_state["segments"]         = segments
+        st.session_state["filename"]         = uploaded_file.name
+        st.session_state["done"]             = True
         st.session_state["correction_count"] = 0
 
-        progress_bar.progress(100, text="✅ Done!")
-        status_text.empty()
+        elapsed_total = time.time() - t_start
+        step_status.success(
+            f"Done — {seg_count[0]} segments in {_fmt_dur(elapsed_total)}"
+        )
+        progress_bar.progress(1.0)
+        metrics_row.empty()
+        seg_preview.empty()
         st.rerun()
 
     except Exception as exc:
+        step_status.error(f"Transcription failed: {exc}")
         progress_bar.empty()
-        status_text.empty()
-        st.error(f"❌ Transcription failed: {exc}")
+        metrics_row.empty()
+        seg_preview.empty()
 
     finally:
         try:

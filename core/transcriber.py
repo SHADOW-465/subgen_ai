@@ -111,36 +111,46 @@ def extract_clip(audio: np.ndarray, sr: int,
 
 
 def transcribe(
-    video_path,
+    video_path=None,
     model_size: str = DEFAULT_MODEL,
     language: Optional[str] = None,
     task: str = "transcribe",
     esp32_port: Optional[str] = None,
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable] = None,
+    audio: Optional[np.ndarray] = None,
+    sr: int = 16000,
 ) -> List[SubtitleSegment]:
     """
     Main transcription pipeline.
 
     Steps:
-      1. Extract audio from video/audio file via ffmpeg.
-      2. Run Faster-Whisper with VAD filter.
-      3. For each segment: compute MFCC fingerprint (HW or SW), SNR penalty,
-         fused confidence, and RED/GREEN label.
-      4. Check DB for a matching correction -> auto-apply if similarity >= 0.80.
+      1. Extract audio (if not pre-supplied).
+      2. Run Faster-Whisper lazily — segments are streamed one at a time so
+         the caller sees real-time progress instead of one blocking call.
+      3. For each segment: MFCC fingerprint (HW or SW), SNR, fused confidence,
+         RED/GREEN label, correction DB lookup.
 
     Args:
-        video_path:        Path to input media.
+        video_path:        Path to input media (required if audio not supplied).
         model_size:        Whisper model variant (default "small").
-        language:          ISO 639-1 language code or None for auto-detect.
-        task:              "transcribe" or "translate" (to English).
-        esp32_port:        Serial port for ESP32 hardware, or None for SW mode.
-        progress_callback: Optional callable(i, total, segment) for UI updates.
+        language:          ISO 639-1 code or None for auto-detect.
+        task:              "transcribe" or "translate".
+        esp32_port:        Serial port for ESP32, or None for SW mode.
+        progress_callback: Optional callable(seg_index, total_duration_s, segment).
+                           seg_index      — 1-based count of segments done.
+                           total_duration_s — total audio length in seconds.
+                           segment        — the completed SubtitleSegment.
+        audio:             Pre-extracted float32 audio array (skip ffmpeg step).
+        sr:                Sample rate for pre-supplied audio.
 
     Returns:
         List of SubtitleSegment, one per Whisper segment.
     """
-    audio, sr = extract_audio(video_path)
-    model     = load_model(model_size)
+    if audio is None:
+        audio, sr = extract_audio(video_path)
+
+    total_duration = len(audio) / sr
+    model = load_model(model_size)
 
     segments_raw, info = model.transcribe(
         audio,
@@ -152,12 +162,12 @@ def transcribe(
         without_timestamps=False,
     )
 
-    detected_lang  = info.language if language is None else language
-    segments_list  = list(segments_raw)   # materialise generator (len() requires this)
-    total          = len(segments_list)
+    detected_lang = info.language if language is None else language
     results: List[SubtitleSegment] = []
 
-    for i, seg in enumerate(segments_list):
+    # Iterate the generator lazily so each segment fires progress_callback
+    # as soon as Whisper finishes it — no upfront list() materialisation.
+    for i, seg in enumerate(segments_raw):
         clip        = extract_clip(audio, sr, seg.start, seg.end)
         fp          = get_fingerprint(clip, sr, esp32_port)
         snr_penalty = compute_snr_penalty(clip, sr)
@@ -165,16 +175,13 @@ def transcribe(
         fused       = compute_fused_conf(asr_conf, snr_penalty)
         label       = label_segment(fused)
 
-        # Estimate SNR dB for display
-        clip_sq      = clip ** 2
-        speech_mask  = np.abs(clip) >= 0.002
-        noise_mask   = ~speech_mask
-        mean_speech  = float(np.mean(clip_sq[speech_mask])) if speech_mask.any() else 1e-10
-        mean_noise   = float(np.mean(clip_sq[noise_mask]))  if noise_mask.any()  else 1e-10
-        snr_db_val   = float(10 * np.log10(max(mean_speech, 1e-10) / max(mean_noise, 1e-10)))
-        snr_db_val   = float(np.clip(snr_db_val, -20.0, 60.0))
+        clip_sq     = clip ** 2
+        speech_mask = np.abs(clip) >= 0.002
+        noise_mask  = ~speech_mask
+        mean_speech = float(np.mean(clip_sq[speech_mask])) if speech_mask.any() else 1e-10
+        mean_noise  = float(np.mean(clip_sq[noise_mask]))  if noise_mask.any()  else 1e-10
+        snr_db_val  = float(np.clip(10 * np.log10(max(mean_speech, 1e-10) / max(mean_noise, 1e-10)), -20.0, 60.0))
 
-        # Embedding correction lookup
         text           = seg.text.strip()
         auto_corrected = False
         if fp.get("ok") and fp.get("mfcc_mean"):
@@ -202,6 +209,6 @@ def transcribe(
         results.append(result_seg)
 
         if progress_callback:
-            progress_callback(i + 1, total, result_seg)
+            progress_callback(i + 1, total_duration, result_seg)
 
     return results

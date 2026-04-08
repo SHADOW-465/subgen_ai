@@ -150,58 +150,150 @@ def compute_mfcc_software(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict:
     }
 
 
-# USB VID:PID pairs commonly used by ESP32 dev boards
+# USB VID:PID pairs for known ESP32 / USB-serial bridge chips.
+# Used as a fast-accept path — devices not in this set are still checked
+# by keyword matching against their FriendlyName / DeviceDesc strings.
 _ESP32_VIDS = {
-    0x10C4,  # Silicon Labs CP2102/CP2104  ← COM9 on this machine
-    0x1A86,  # QinHeng CH340/CH341
-    0x0403,  # FTDI
-    0x303A,  # Espressif native USB
+    0x10C4,  # Silicon Labs CP2102/CP2104
+    0x1A86,  # QinHeng CH340/CH341/CH9102
+    0x0403,  # FTDI FT232
+    0x303A,  # Espressif native USB (ESP32-S2/S3/C3)
+    0x2341,  # Arduino SA (some ESP32 dev-board variants)
+    0x239A,  # Adafruit (ESP32 Feather etc.)
+    0x1B4F,  # SparkFun
 }
 
-_ESP32_KEYWORDS = ["cp210", "ch340", "ch341", "esp32", "uart", "ftdi", "usb serial", "usb-serial"]
+# Keywords matched against FriendlyName / DeviceDesc when VID is unknown.
+_ESP32_KEYWORDS = [
+    "cp210", "ch340", "ch341", "ch9102",
+    "esp32", "esp8266",
+    "ftdi", "ft232",
+    "usb serial", "usb-serial", "usb uart",
+    "silabs", "silicon labs",
+    "nodemcu", "wemos", "lolin",
+]
 
-# HWID prefixes that are definitively NOT USB-serial (skip them for speed).
-# On Windows, Bluetooth ports have HWIDs starting with "BTHENUM"
-# and Intel AMT SOL ports start with "PCI".
-_SKIP_HWID_PREFIXES = ("bthenum", "pci\\", "acpi\\")
+# Registry key paths under HKLM that hold USB device info.
+_USB_ENUM_KEY   = r"SYSTEM\CurrentControlSet\Enum\USB"
+_USBSER_ENUM_KEY = r"SYSTEM\CurrentControlSet\Enum\USB\*"   # placeholder, iterated below
 
 
-def _hwid_is_usb(hwid: str) -> bool:
-    """Fast pre-check: return False if the HWID is definitely not a USB serial port."""
-    h = (hwid or "").lower()
-    return not any(h.startswith(p) for p in _SKIP_HWID_PREFIXES)
+def _registry_scan_all_usb_com_ports() -> list:
+    """
+    Scan HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB for every device that has
+    a COM port assignment (Device Parameters\\PortName).
+
+    For each found port, also read FriendlyName and DeviceDesc from the
+    device's registry key so we can do keyword-based matching without needing
+    pyserial or SetupAPI (both of which block on Windows when Bluetooth COM
+    ports are present).
+
+    Returns a list of dicts:
+        device      — "COM8"
+        description — FriendlyName or DeviceDesc string (may be empty)
+        hwid        — "USB VID:PID=10C4:EA60 SER=..."
+        vid         — int or None
+        pid         — int or None
+    """
+    import winreg
+    import re
+
+    results = []
+    vid_pid_re = re.compile(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", re.I)
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _USB_ENUM_KEY) as usb_root:
+            n_entries = winreg.QueryInfoKey(usb_root)[0]
+            for i in range(n_entries):
+                try:
+                    vid_pid_name = winreg.EnumKey(usb_root, i)
+                except OSError:
+                    continue
+
+                m = vid_pid_re.match(vid_pid_name)
+                vid = int(m.group(1), 16) if m else None
+                pid = int(m.group(2), 16) if m else None
+
+                try:
+                    with winreg.OpenKey(usb_root, vid_pid_name) as vp_key:
+                        n_serials = winreg.QueryInfoKey(vp_key)[0]
+                        for j in range(n_serials):
+                            try:
+                                serial_name = winreg.EnumKey(vp_key, j)
+                            except OSError:
+                                continue
+
+                            # Read FriendlyName / DeviceDesc from the device key
+                            description = ""
+                            try:
+                                with winreg.OpenKey(vp_key, serial_name) as dev_key:
+                                    for val_name in ("FriendlyName", "DeviceDesc"):
+                                        try:
+                                            description, _ = winreg.QueryValueEx(dev_key, val_name)
+                                            break
+                                        except FileNotFoundError:
+                                            pass
+                            except OSError:
+                                pass
+
+                            # Read COM port name from Device Parameters
+                            try:
+                                with winreg.OpenKey(
+                                    vp_key, serial_name + "\\Device Parameters"
+                                ) as dp_key:
+                                    port_name, _ = winreg.QueryValueEx(dp_key, "PortName")
+                            except (FileNotFoundError, OSError):
+                                continue  # no COM port assignment for this device
+
+                            vid_str = m.group(1).upper() if m else "????"
+                            pid_str = m.group(2).upper() if m else "????"
+                            results.append({
+                                "device":      port_name,
+                                "description": description,
+                                "hwid":        f"USB VID:PID={vid_str}:{pid_str} SER={serial_name}",
+                                "vid":         vid,
+                                "pid":         pid,
+                            })
+                except OSError:
+                    continue
+    except Exception:
+        pass  # registry unavailable — caller falls back to pyserial
+
+    return results
 
 
-def _port_is_esp32(port) -> bool:
-    """Return True if a port entry looks like an ESP32 / common USB-serial adapter."""
-    # Fast: skip Bluetooth & PCI ports entirely
-    if not _hwid_is_usb(port.hwid or ""):
-        return False
-    # Check USB VID first (fastest path)
-    if port.vid in _ESP32_VIDS:
+def _is_esp32_port(entry: dict) -> bool:
+    """
+    Return True if a port registry entry looks like an ESP32 / USB-serial adapter.
+
+    Decision order (fastest first):
+      1. VID in known-ESP32 set  → accept
+      2. Keyword in description  → accept
+      3. Otherwise               → reject
+    """
+    vid = entry.get("vid")
+    if vid is not None and vid in _ESP32_VIDS:
         return True
-    # Then keyword scan on description/manufacturer/hwid strings
-    desc  = (port.description  or "").lower()
-    manuf = (port.manufacturer or "").lower()
-    hwid  = (port.hwid         or "").lower()
-    return any(k in desc or k in manuf or k in hwid for k in _ESP32_KEYWORDS)
+
+    desc = (entry.get("description") or "").lower()
+    hwid = (entry.get("hwid") or "").lower()
+    combined = desc + " " + hwid
+    return any(kw in combined for kw in _ESP32_KEYWORDS)
 
 
 def _fast_scan_esp32_ports() -> list:
     """
-    Fast ESP32 port discovery — instant on Windows, falls back to pyserial elsewhere.
+    Return ESP32-compatible COM ports.
 
-    On Windows, reads HKLM\\SYSTEM\\CurrentControlSet\\Enum\\USB from the
-    registry to enumerate USB devices and their COM port assignments WITHOUT
-    calling win32 SetupAPI (which blocks for 60+ seconds when Bluetooth COM
-    ports are present).
+    Windows path: reads the registry directly — completes in milliseconds,
+    never calls SetupAPI, never blocks on Bluetooth COM ports.
+    Matches by VID (fast-accept) OR by FriendlyName/DeviceDesc keyword.
 
-    Returns a list of dicts with keys: device, description, vid, pid, hwid.
-    Only returns ports whose VID matches _ESP32_VIDS.
+    Non-Windows path: uses pyserial with keyword+VID filtering.
     """
     import platform
+
     if platform.system() != "Windows":
-        # Non-Windows: use pyserial normally (no Bluetooth issue)
         if not _SERIAL_AVAILABLE:
             return []
         return [
@@ -213,139 +305,142 @@ def _fast_scan_esp32_ports() -> list:
                 "pid":         p.pid,
             }
             for p in serial.tools.list_ports.comports()
-            if _port_is_esp32(p)
+            if (
+                (p.vid in _ESP32_VIDS)
+                or any(
+                    kw in (p.description or "").lower()
+                    or kw in (p.manufacturer or "").lower()
+                    or kw in (p.hwid or "").lower()
+                    for kw in _ESP32_KEYWORDS
+                )
+            )
         ]
 
-    # Windows fast path: read registry
-    try:
-        import winreg, re
-        results = []
-        usb_key_path = r"SYSTEM\CurrentControlSet\Enum\USB"
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, usb_key_path) as usb_key:
-            n_vid = winreg.QueryInfoKey(usb_key)[0]  # number of subkeys
-            for i in range(n_vid):
-                try:
-                    vid_pid_name = winreg.EnumKey(usb_key, i)  # e.g. "VID_10C4&PID_EA60"
-                    # Quick VID check before going deeper
-                    m = re.match(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", vid_pid_name)
-                    if not m:
-                        continue
-                    vid = int(m.group(1), 16)
-                    pid = int(m.group(2), 16)
-                    if vid not in _ESP32_VIDS:
-                        continue
-                    # Drill down: vid_pid_name -> serial_number -> Device Parameters -> PortName
-                    with winreg.OpenKey(usb_key, vid_pid_name) as vp_key:
-                        n_serial = winreg.QueryInfoKey(vp_key)[0]
-                        for j in range(n_serial):
-                            try:
-                                serial_name = winreg.EnumKey(vp_key, j)
-                                dp_path = f"{serial_name}\\Device Parameters"
-                                try:
-                                    with winreg.OpenKey(vp_key, dp_path) as dp_key:
-                                        port_name, _ = winreg.QueryValueEx(dp_key, "PortName")
-                                        results.append({
-                                            "device":      port_name,  # e.g. "COM9"
-                                            "description": f"USB VID_{m.group(1)}&PID_{m.group(2)}",
-                                            "hwid":        f"USB VID:PID={m.group(1)}:{m.group(2)} SER={serial_name}",
-                                            "vid":         vid,
-                                            "pid":         pid,
-                                        })
-                                except FileNotFoundError:
-                                    pass
-                            except OSError:
-                                pass
-                except OSError:
-                    pass
-        return results
-    except Exception:
-        # Registry access failed — fall back to pyserial with a generous timeout
-        if not _SERIAL_AVAILABLE:
-            return []
-        import threading
-        found: list = []
-        ev = threading.Event()
-        def _worker():
-            try:
-                found.extend(
-                    {
-                        "device":      p.device,
-                        "description": p.description or "",
-                        "hwid":        p.hwid or "",
-                        "vid":         p.vid,
-                        "pid":         p.pid,
-                    }
-                    for p in serial.tools.list_ports.comports()
-                    if _port_is_esp32(p)
-                )
-            finally:
-                ev.set()
-        threading.Thread(target=_worker, daemon=True).start()
-        ev.wait(timeout=10.0)
-        return found
+    # Windows — fast registry scan
+    all_ports = _registry_scan_all_usb_com_ports()
+    if all_ports:
+        return [p for p in all_ports if _is_esp32_port(p)]
 
-
-def _scan_all_ports_pyserial() -> list:
-    """
-    Return ALL serial ports using pyserial (slow on Windows if BT ports present).
-    Used only by list_all_ports() which is called from the diagnostics expander,
-    not the hot path.
-    """
+    # Registry scan returned nothing — fall back to pyserial with timeout
     if not _SERIAL_AVAILABLE:
         return []
     import threading
-    result: list = []
+    found: list = []
     ev = threading.Event()
-    def _worker():
+
+    def _worker() -> None:
         try:
-            result.extend(serial.tools.list_ports.comports())
+            found.extend(
+                {
+                    "device":      p.device,
+                    "description": p.description or "",
+                    "hwid":        p.hwid or "",
+                    "vid":         p.vid,
+                    "pid":         p.pid,
+                }
+                for p in serial.tools.list_ports.comports()
+                if (
+                    (p.vid in _ESP32_VIDS)
+                    or any(
+                        kw in (p.description or "").lower()
+                        or kw in (p.manufacturer or "").lower()
+                        or kw in (p.hwid or "").lower()
+                        for kw in _ESP32_KEYWORDS
+                    )
+                )
+            )
         finally:
             ev.set()
+
     threading.Thread(target=_worker, daemon=True).start()
-    ev.wait(timeout=12.0)
-    return result
+    ev.wait(timeout=10.0)
+    return found
+
+
+def _scan_all_ports_registry() -> list:
+    """
+    Return ALL USB COM ports from the registry (for diagnostics).
+    Instant on Windows — no pyserial, no SetupAPI, no Bluetooth blocking.
+    """
+    import platform
+    if platform.system() != "Windows":
+        if not _SERIAL_AVAILABLE:
+            return []
+        import threading
+        result: list = []
+        ev = threading.Event()
+        def _worker() -> None:
+            try:
+                result.extend(serial.tools.list_ports.comports())
+            finally:
+                ev.set()
+        threading.Thread(target=_worker, daemon=True).start()
+        ev.wait(timeout=12.0)
+        return [
+            {"device": p.device, "description": p.description or "",
+             "hwid": p.hwid or "", "vid": p.vid, "pid": p.pid}
+            for p in result
+        ]
+    return _registry_scan_all_usb_com_ports()
+
+
+def _port_is_alive(port: str) -> bool:
+    """
+    Return True if the COM port is physically present on the system.
+
+    Strategy: attempt a non-blocking open with pyserial.
+      - Opens fine          → device is connected
+      - "Access denied"     → device is connected but in use by another process
+      - "No such file" etc. → device is disconnected / ghost registry entry
+    """
+    if not _SERIAL_AVAILABLE:
+        return False
+    try:
+        s = serial.Serial(port, timeout=0)
+        s.close()
+        return True
+    except serial.SerialException as exc:
+        # Port exists but is held by another process → device is present
+        msg = str(exc).lower()
+        if "access" in msg or "denied" in msg or "permission" in msg:
+            return True
+        return False
 
 
 def find_esp32_port() -> Optional[str]:
     """
-    Auto-detect ESP32 by checking for CP2102/CH340/FTDI USB descriptors.
-    Returns the device path (e.g. 'COM9' or '/dev/ttyUSB0') or None.
-    Uses the fast Windows registry path; Bluetooth ports are never probed.
+    Auto-detect ESP32. Returns first live port string or None.
+    Registry scan finds candidates; _port_is_alive() confirms physical presence.
     """
     if not _SERIAL_AVAILABLE:
         return None
-    ports = _fast_scan_esp32_ports()
-    return ports[0]["device"] if ports else None
+    for p in _fast_scan_esp32_ports():
+        if _port_is_alive(p["device"]):
+            return p["device"]
+    return None
 
 
 def find_all_esp32_ports() -> list:
     """
-    Return a list of ALL detected ESP32-compatible port device strings.
-    Uses the fast Windows registry path — completes in milliseconds.
+    Return all live ESP32-compatible port strings.
+    Registry scan for candidates + pyserial open-probe for liveness.
     """
     if not _SERIAL_AVAILABLE:
         return []
-    return [p["device"] for p in _fast_scan_esp32_ports()]
+    return [
+        p["device"]
+        for p in _fast_scan_esp32_ports()
+        if _port_is_alive(p["device"])
+    ]
 
 
 def list_all_ports() -> list:
     """
-    Return info about every serial port found (for diagnostics / manual selection).
+    Return info about every USB COM port (for diagnostics / manual selection).
     Each entry is a dict: device, description, hwid, vid, pid.
-    Uses pyserial with a timeout (may be slow on Windows due to Bluetooth ports).
+    Uses the registry on Windows — instant, never blocks on Bluetooth ports.
     """
-    if not _SERIAL_AVAILABLE:
-        return []
-    result = []
-    for p in _scan_all_ports_pyserial():
-        result.append({
-            "device":      p.device,
-            "description": p.description or "",
-            "hwid":        p.hwid        or "",
-            "vid":         p.vid,
-            "pid":         p.pid,
-        })
-    return result
+    return _scan_all_ports_registry()
 
 
 def send_audio_to_esp32(audio_int16: np.ndarray, port: str) -> dict:

@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -)",
+      "WebFetch(domain:www.silabs.com)",
+      "Bash(powershell -Command \"Invoke-WebRequest -Uri 'https://www.silabs.com/documents/public/software/CP210x_VCP_Windows.zip' -OutFile 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows.zip'; Write-Host 'Download complete'\")",
+      "Bash(powershell -Command \"Expand-Archive -Path 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows.zip' -DestinationPath 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows' -Force; Get-ChildItem 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows'\")",
+      "Bash(powershell -Command \"Get-ChildItem 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows\\\\CP210x_VCP_Windows' -Recurse | Select-Object FullName\")",
+      "Bash(powershell -Command \"Start-Process 'C:\\\\Users\\\\acer\\\\Downloads\\\\CP210x_VCP_Windows\\\\CP210x_VCP_Windows\\\\CP210xVCPInstaller_x64.exe' -Wait -Verb RunAs; Write-Host 'Installer finished'\")"
+    ]
+  }
+}
