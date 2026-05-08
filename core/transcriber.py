@@ -36,24 +36,49 @@ SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 DEFAULT_MODEL    = "small"
 
 
+# Keywords that indicate a CUDA environment issue, not a code bug.
+_CUDA_ERROR_KEYWORDS = (
+    "cuda", "cudnn", "cublas", "driver", "runtime version",
+    "insufficient", "nvml", "libcuda",
+)
+
+
+def _is_cuda_env_error(msg: str) -> bool:
+    """Return True if the message looks like a CUDA driver/library problem."""
+    low = msg.lower()
+    return any(kw in low for kw in _CUDA_ERROR_KEYWORDS)
+
+
 def _detect_device() -> Tuple[str, str]:
     """
     Auto-detect the best available compute device.
 
+    Uses a two-step probe:
+      1. Check ctranslate2 supported types for "cuda" (fast, no model needed).
+      2. If that passes, do a minimal CTranslate2 StorageView allocation on CUDA
+         to catch driver-version mismatches (the scenario that triggered the bug).
+
     Returns:
         (device, compute_type) tuple:
-          - ("cuda", "float16") when an NVIDIA GPU with cuBLAS/cuDNN is available.
-          - ("cpu",  "int8")   as a safe fallback.
+          - ("cuda", "float16") when an NVIDIA GPU is fully usable.
+          - ("cpu",  "int8")   as a safe fallback for any CUDA problem.
     """
     try:
-        import ctranslate2  # faster-whisper depends on this
-        # ctranslate2 exposes get_supported_compute_types which raises if CUDA
-        # libs (cuBLAS/cuDNN) are not installed, making it a reliable probe.
+        import ctranslate2
         cuda_types = ctranslate2.get_supported_compute_types("cuda")
-        if cuda_types:  # non-empty list means CUDA is usable
-            return "cuda", "float16"
+        if not cuda_types:
+            return "cpu", "int8"
+
+        # Step 2: verify the CUDA runtime actually works by doing a tiny
+        # allocation. This catches "driver version is insufficient" and similar
+        # errors that the type-list probe above does not detect.
+        ctranslate2.StorageView([1], device="cuda")
+        return "cuda", "float16"
+
     except Exception:
+        # Any failure here (missing libs, bad driver, etc.) → fall back silently.
         pass
+
     return "cpu", "int8"
 
 
@@ -136,14 +161,29 @@ def load_model(model_size: str = DEFAULT_MODEL) -> WhisperModel:
                       with a human-readable message.
     """
     if model_size not in _MODEL_CACHE:
+        device, compute_type = _detect_device()
         try:
-            device, compute_type = _detect_device()
             _MODEL_CACHE[model_size] = WhisperModel(
                 model_size, device=device, compute_type=compute_type
             )
         except Exception as exc:
             msg = str(exc)
-            # Surface common mistakes with a clear explanation
+
+            # ── CUDA runtime error → silent CPU retry ────────────────────────
+            # Catches cases where _detect_device() probe passed but the full
+            # model load still fails (e.g. outdated driver, missing cuDNN op).
+            if device == "cuda" and _is_cuda_env_error(msg):
+                try:
+                    _MODEL_CACHE[model_size] = WhisperModel(
+                        model_size, device="cpu", compute_type="int8"
+                    )
+                    return _MODEL_CACHE[model_size]  # success on CPU
+                except Exception as cpu_exc:
+                    # CPU also failed — fall through to normal error handling
+                    exc = cpu_exc
+                    msg = str(cpu_exc)
+
+            # ── Known HuggingFace / format errors ───────────────────────────
             if "401" in msg or "Invalid username" in msg or "authentication" in msg.lower():
                 raise RuntimeError(
                     f"Model not found or not public on HuggingFace: '{model_size}'.\n\n"
