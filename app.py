@@ -31,11 +31,13 @@ st.set_page_config(
 
 # ── Local imports (after sys.path fix) ──────────────────────────────────────
 from subgen_ai.core.models import SubtitleSegment, CorrectionRecord, ValidationResult
-from subgen_ai.core.qc_engine import validate_correction
+from subgen_ai.core.qc_engine import validate_correction, is_snr_acceptable, SNR_GATE_DB
 from subgen_ai.core.esp32_validator import (
     find_esp32_port, find_all_esp32_ports, list_all_ports, get_fingerprint
 )
-from subgen_ai.core.transcriber import transcribe, SUPPORTED_MODELS, DEFAULT_MODEL
+from subgen_ai.core.transcriber import (
+    transcribe, SUPPORTED_MODELS, DEFAULT_MODEL, INDIC_MODELS, _detect_device
+)
 from subgen_ai.db.correction_store import (
     save_correction, get_db_stats, delete_correction, init_db
 )
@@ -65,6 +67,7 @@ def _init_state() -> None:
         "hw_status": "software",  # "connected" | "software" | "error"
         "correction_count": 0,    # int — corrections saved this session
         "filter_red_only": False, # bool — review tab filter
+        "custom_model":  None,    # str | None — HuggingFace ID or path overriding model_size
         "video_bytes": None,   # bytes | None — raw uploaded file for the player
         "video_ext":   "",     # str — e.g. ".mp4", ".avi"
     }
@@ -154,6 +157,61 @@ def render_sidebar() -> None:
             index=SUPPORTED_MODELS.index(DEFAULT_MODEL),
             help="Larger = more accurate but slower. 'small' is recommended.",
         )
+
+        # ── Device info (auto-detected) ──────────────────────────────────────
+        _device, _ctype = _detect_device()
+        if _device == "cuda":
+            st.success("⚡ GPU detected — using CUDA (float16)")
+        else:
+            st.info("💻 No GPU detected — using CPU (int8)")
+
+        # ── Indic / custom model override ────────────────────────────────────
+        with st.expander("🌐 Indic / Custom Model", expanded=False):
+            st.caption(
+                "Override the model above with a fine-tuned Indic model or "
+                "any HuggingFace CTranslate2 repo. Leave blank to use the "
+                "standard model selected above.\n\n"
+                "⚠ **Models must be in CTranslate2 format** (contain `model.bin`). "
+                "vasista22/* models are PyTorch — convert them locally first "
+                "(see `core/transcriber.py` for the one-line command)."
+            )
+
+            # Quick-pick from the curated list
+            indic_options = ["(none — use standard model above)"] + list(INDIC_MODELS.keys())
+            indic_pick = st.selectbox(
+                "Curated Indic models",
+                options=indic_options,
+                index=0,
+                help=(
+                    "Models must be in CTranslate2 format. "
+                    "vasista22/* models are pre-converted and download automatically. "
+                    "ai4bharat/* models may need manual conversion — see transcriber.py."
+                ),
+            )
+
+            # Free-form field: HuggingFace repo ID or local path
+            custom_model_input = st.text_input(
+                "Or enter a HuggingFace repo ID / local path",
+                value="",
+                placeholder="e.g. vasista22/faster-whisper-tamil-medium",
+                help=(
+                    "Any faster-whisper compatible model. "
+                    "Must contain model.bin (CTranslate2 format). "
+                    "For local models enter the full directory path."
+                ),
+            )
+
+            # Determine effective model: free-form > curated pick > standard
+            if custom_model_input.strip():
+                effective_model = custom_model_input.strip()
+                st.success(f"✅ Using custom model: `{effective_model}`")
+            elif indic_pick != "(none — use standard model above)":
+                effective_model = INDIC_MODELS[indic_pick]
+                st.info(f"Using: `{effective_model}`")
+            else:
+                effective_model = None   # fall back to the standard selectbox
+
+            st.session_state["custom_model"] = effective_model
 
         task_choice = st.radio(
             "Task",
@@ -262,7 +320,7 @@ def render_tab_upload() -> None:
     uploaded = st.file_uploader(
         "Choose a video or audio file",
         type=["mp4", "avi", "mov", "mkv", "wav", "mp3", "m4a"],
-        help="Supports MP4, AVI, MOV, MKV, WAV, MP3, M4A",
+        help="Supports MP4, AVI, MOV, MKV, WAV, MP3, M4A — no size limit.",
     )
 
     if uploaded is not None:
@@ -348,8 +406,14 @@ def _run_transcription(uploaded_file) -> None:
                 f"{seg.text[:80]}{'…' if len(seg.text) > 80 else ''}"
             )
 
+        # Use custom/Indic model if one was selected, else the standard dropdown.
+        effective_model = (
+            st.session_state.get("custom_model")
+            or st.session_state.get("model_size", DEFAULT_MODEL)
+        )
+
         segments = transcribe(
-            model_size=st.session_state.get("model_size", DEFAULT_MODEL),
+            model_size=effective_model,
             language=st.session_state.get("language"),
             task=st.session_state.get("task", "transcribe"),
             esp32_port=st.session_state.get("port"),
@@ -374,6 +438,24 @@ def _run_transcription(uploaded_file) -> None:
         seg_preview.empty()
         st.rerun()
 
+    except RuntimeError as exc:
+        msg = str(exc)
+        # Model-load errors get a formatted callout with actionable guidance
+        if any(kw in msg for kw in ("Model not found", "Repository Not Found",
+                                     "Failed to load model", "CTranslate2",
+                                     "PyTorch", "401", "404")):
+            step_status.error("❌ Model load failed")
+            st.error(msg)
+            st.info(
+                "**Quick fix:** Use the **🌐 Indic / Custom Model** section in the "
+                "sidebar to pick a verified model, or enter the path to a locally "
+                "converted CTranslate2 model directory."
+            )
+        else:
+            step_status.error(f"Transcription failed: {exc}")
+        progress_bar.empty()
+        metrics_row.empty()
+        seg_preview.empty()
     except Exception as exc:
         step_status.error(f"Transcription failed: {exc}")
         progress_bar.empty()
@@ -526,24 +608,47 @@ def _do_save_correction(
     vr: Optional[ValidationResult],
     override: bool,
 ) -> None:
-    """Persist a correction to SQLite and update session state."""
-    try:
-        record = CorrectionRecord(
-            id=None,
-            segment_start=seg.start,
-            segment_end=seg.end,
-            original_text=seg.text,
-            corrected_text=new_text,
-            language=seg.language,
-            mfcc_mean=seg.mfcc_mean,
-            mfcc_var=seg.mfcc_var,
-            match_score=vr.score if vr else 0.0,
-            hw_used=vr.hw_used if vr else False,
-            created_at=datetime.now().isoformat(),
-        )
-        save_correction(record)
+    """Persist a correction and update session state.
 
-        # Update segment in session state
+    Always updates the in-session subtitle text so exports are correct.
+    DB write is skipped when seg.snr_db < SNR_GATE_DB — noisy audio
+    produces MFCC fingerprints dominated by the noise floor rather than
+    speech content, making them unreliable keys for nearest-neighbour lookup.
+    """
+    try:
+        # Capture original text before any mutation — seg may be the same
+        # Python object as the entry in st.session_state["segments"].
+        original_text = seg.text
+
+        # ── SNR gate: decide whether to write to DB ──────────────────────────
+        snr_ok = is_snr_acceptable(seg.snr_db)
+
+        if not snr_ok:
+            st.warning(
+                f"⚠ Audio SNR {seg.snr_db:.1f} dB is below the "
+                f"{SNR_GATE_DB:.0f} dB gate — subtitle updated for this "
+                "session but **not saved to the correction DB**. "
+                "Noisy audio produces unreliable MFCC fingerprints for "
+                "correction lookup."
+            )
+        else:
+            # ── Write to correction DB ───────────────────────────────────────
+            record = CorrectionRecord(
+                id=None,
+                segment_start=seg.start,
+                segment_end=seg.end,
+                original_text=original_text,
+                corrected_text=new_text,
+                language=seg.language,
+                mfcc_mean=seg.mfcc_mean,
+                mfcc_var=seg.mfcc_var,
+                match_score=vr.score if vr else 0.0,
+                hw_used=vr.hw_used if vr else False,
+                created_at=datetime.now().isoformat(),
+            )
+            save_correction(record)
+
+        # ── Always update in-session text regardless of SNR gate ─────────────
         segs: list[SubtitleSegment] = st.session_state["segments"]
         for s in segs:
             if s.index == seg.index:

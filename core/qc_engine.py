@@ -17,6 +17,12 @@ THRESHOLD_HIGH       = 0.72
 THRESHOLD_MEDIUM     = 0.55
 THRESHOLD_DB_APPLY   = 0.80   # auto-apply correction at inference
 
+# SNR Gate — corrections from segments below this threshold are applied to the
+# in-session subtitle text but are NOT written to the SQLite correction DB.
+# Noisy audio produces MFCC fingerprints dominated by the noise floor rather
+# than speech content, which corrupts the nearest-neighbour lookup.
+SNR_GATE_DB: float = 15.0
+
 
 def compute_asr_conf(avg_logprob: float) -> float:
     """Convert Whisper avg_logprob to [0,1] linear confidence via exp()."""
@@ -82,6 +88,19 @@ def compute_fused_conf(asr_conf: float, snr_penalty: float,
 def label_segment(fused_conf: float) -> str:
     """Return 'GREEN' if fused_conf >= threshold, else 'RED'."""
     return "GREEN" if fused_conf >= FUSED_CONF_THRESHOLD else "RED"
+
+
+def is_snr_acceptable(snr_db: float) -> bool:
+    """
+    Return True if the segment SNR meets the minimum quality gate.
+
+    Below SNR_GATE_DB the MFCC fingerprint is unreliable as a correction
+    lookup key — spectral subtraction only removes an estimated noise floor,
+    and at low SNR the residual noise still dominates the cepstral coefficients.
+    The correction is still applied to the in-session subtitle text for export
+    accuracy, but must not be stored in the self-improvement database.
+    """
+    return snr_db >= SNR_GATE_DB
 
 
 def cosine_similarity(v1: list, v2: list) -> float:

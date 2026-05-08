@@ -17,19 +17,30 @@
  *
  * ESP32 → HOST  (single JSON line, UTF-8, terminated with '\n'):
  *   Success:
- *     {"ok":true,"frames":<int>,"rms":<float>,"mfcc_mean":[f0,…,f11],"mfcc_var":[f0,…,f11]}
+ *     {"ok":true,"frames":<int>,"rms":<float>,"snr_db":<float>,
+ *      "mfcc_mean":[f0,…,f11],"mfcc_var":[f0,…,f11]}
  *   Error:
  *     {"ok":false,"error":"<reason>"}
  *
  * ── ALGORITHM (mirrors subgen_ai/core/esp32_validator.py) ─────────────────
- *   For each 25 ms frame (400 samples) stepped by 10 ms (160 samples):
- *     1. Apply Hanning window (matches Python np.hanning)
- *     2. Zero-pad to 512 samples
- *     3. 512-point real FFT  → power spectrum (|X|² / N_FFT)
- *     4. Multiply by 26-band triangular mel filterbank (0–8 kHz)
- *     5. log10(energy + 1e-9)
- *     6. DCT-II with ortho normalisation → take first 12 coefficients
- *   Aggregate mean + variance across all frames.
+ *   Two-pass spectral subtraction:
+ *
+ *   Pass 1 — noise floor estimation:
+ *     For each 25 ms frame stepped by 10 ms:
+ *       1. Apply Hanning window + zero-pad to 512 samples
+ *       2. 512-point real FFT → power spectrum (|X|² / N_FFT)
+ *       3. Multiply by 26-band triangular mel filterbank → raw mel energies
+ *       4. Classify frame: RMS < RMS_SILENCE → noise, else speech
+ *     noise_floor[m] = mean raw mel energy over all noise frames, per band.
+ *     snr_db = 10*log10(mean_speech_mel / mean_noise_mel), clipped [-20, 60].
+ *
+ *   Pass 2 — denoised MFCC:
+ *     For each frame:
+ *       1. Recompute raw mel energies (same as Pass 1)
+ *       2. mel_denoised[m] = max(mel[m] - noise_floor[m], 1e-9)
+ *       3. log10(mel_denoised[m])          ← log AFTER subtraction
+ *       4. DCT-II with ortho normalisation → first 12 coefficients
+ *     Aggregate mean + variance across all frames.
  *
  * ── NOTES ────────────────────────────────────────────────────────────────
  *  • This file is reference documentation. The Python app does NOT
@@ -52,7 +63,11 @@
 #define FMIN_HZ       0.0f
 #define FMAX_HZ       8000.0f
 #define MAX_SAMPLES   32000     // 2 s at 16 kHz
-#define BAUD_RATE     460800
+#define BAUD_RATE     2000000   // 2 Mbps — requires CH340/CH341 bridge chip
+                               // (CP2102 max is ~921600; use CH340 boards)
+                               // At 2 Mbps: 64 KB audio transfers in ~0.32 s
+                               // vs ~1.39 s at 460800 — critical for real-time use
+#define RMS_SILENCE   0.002f    // frames below this normalised RMS = noise frames
 
 // ── Mel filterbank (pre-computed once) ────────────────────────────────────
 static float mel_fb[N_MELS][N_FFT / 2 + 1];
@@ -153,76 +168,130 @@ static float dct_ortho(float *x, int n, int k) {
     return scale * sum;
 }
 
-// ── Compute MFCC for one audio frame ─────────────────────────────────────
+// ── Raw mel energy extraction (no log, no DCT) ───────────────────────────
+// Used by both passes. Log compression and DCT are applied in Pass 2 AFTER
+// spectral subtraction, so they must not happen inside this function.
 static float frame_buf[N_FFT];
 static float mel_e[N_MELS];
 
-static void compute_frame_mfcc(const float *frame, float *mfcc_out) {
-    // Hanning window + zero-pad
+static void compute_frame_mel_raw(const float *frame, float *mel_out) {
+    // Hanning window + zero-pad to N_FFT
     memset(frame_buf, 0, sizeof(frame_buf));
     for (int i = 0; i < WIN_LENGTH; i++)
         frame_buf[i] = frame[i] * hanning[i];
 
-    // FFT → power spectrum
+    // 512-point real FFT
     fft_real(frame_buf, N_FFT);
-    int n_bins = N_FFT / 2 + 1;
-    float power[n_bins];
-    for (int k = 0; k < n_bins; k++) {
-        float re = fft_buf[2*k], im = fft_buf[2*k+1];
-        power[k] = (re*re + im*im) / N_FFT;
-    }
 
-    // Mel filterbank energies + log compression
+    // Mel filterbank energies — raw (pre-log)
+    int n_bins = N_FFT / 2 + 1;
     for (int m = 0; m < N_MELS; m++) {
         float e = 0.0f;
-        for (int k = 0; k < n_bins; k++)
-            e += mel_fb[m][k] * power[k];
-        mel_e[m] = log10f(e + 1e-9f);
+        for (int k = 0; k < n_bins; k++) {
+            float re = fft_buf[2*k], im = fft_buf[2*k+1];
+            e += mel_fb[m][k] * (re*re + im*im) / N_FFT;
+        }
+        mel_out[m] = e;  // raw energy — log applied after spectral subtraction
     }
-
-    // DCT-II → 12 coefficients
-    for (int c = 0; c < N_MFCC; c++)
-        mfcc_out[c] = dct_ortho(mel_e, N_MELS, c);
 }
 
 // ── Static audio + accumulator buffers ───────────────────────────────────
 static int16_t pcm_buf[MAX_SAMPLES];
 static float   mfcc_sum[N_MFCC];
 static float   mfcc_sq[N_MFCC];
-static float   frame_mfcc[N_MFCC];
 
-// ── Main pipeline ─────────────────────────────────────────────────────────
+// ── Main pipeline — two-pass spectral subtraction ────────────────────────
 static void process_audio(int n_samples) {
     if (!fb_ready) build_mel_filterbank();
 
-    // Normalise to float32 [-1, 1]
-    // Compute RMS
+    // Overall clip RMS (for JSON metadata)
     double rms_acc = 0.0;
     for (int i = 0; i < n_samples; i++)
         rms_acc += (double)pcm_buf[i] * pcm_buf[i];
     float rms = sqrtf((float)(rms_acc / n_samples)) / 32768.0f;
 
+    // ── Pass 1: per-band noise floor estimation ───────────────────────────
+    float noise_floor[N_MELS];
+    memset(noise_floor, 0, sizeof(noise_floor));
+    int   n_noise = 0, n_speech = 0;
+    float sum_s   = 0.0f, sum_n = 0.0f;
+
+    for (int s = 0; s + WIN_LENGTH <= n_samples; s += HOP_LENGTH) {
+        float win_f[WIN_LENGTH];
+        float rms_f = 0.0f;
+        for (int i = 0; i < WIN_LENGTH; i++) {
+            win_f[i] = pcm_buf[s + i] / 32768.0f;
+            rms_f += win_f[i] * win_f[i];
+        }
+        rms_f = sqrtf(rms_f / WIN_LENGTH);
+
+        compute_frame_mel_raw(win_f, mel_e);
+
+        // Per-frame mean mel energy for SNR estimation
+        float fmean = 0.0f;
+        for (int m = 0; m < N_MELS; m++) fmean += mel_e[m];
+        fmean /= N_MELS;
+
+        if (rms_f < RMS_SILENCE) {
+            // Noise frame — accumulate toward noise floor
+            for (int m = 0; m < N_MELS; m++) noise_floor[m] += mel_e[m];
+            sum_n += fmean;
+            n_noise++;
+        } else {
+            // Speech frame
+            sum_s += fmean;
+            n_speech++;
+        }
+    }
+
+    // Normalise noise floor to mean (all-zero if no silence detected)
+    if (n_noise > 0)
+        for (int m = 0; m < N_MELS; m++) noise_floor[m] /= n_noise;
+
+    // Mel-domain SNR
+    float snr_db;
+    if (n_speech > 0 && n_noise > 0) {
+        float ms = sum_s / n_speech;
+        float mn = (sum_n / n_noise < 1e-10f) ? 1e-10f : sum_n / n_noise;
+        snr_db = 10.0f * log10f(ms / mn);
+        if (snr_db < -20.0f) snr_db = -20.0f;
+        if (snr_db >  60.0f) snr_db =  60.0f;
+    } else if (n_speech > 0) {
+        snr_db = 60.0f;   // clean clip — no noise frames
+    } else {
+        snr_db = -20.0f;  // all noise or empty
+    }
+
+    // ── Pass 2: subtract noise floor → log10 → DCT-II → accumulate ──────
     memset(mfcc_sum, 0, sizeof(mfcc_sum));
     memset(mfcc_sq,  0, sizeof(mfcc_sq));
     int n_frames = 0;
 
-    for (int start = 0; start + WIN_LENGTH <= n_samples; start += HOP_LENGTH) {
-        // Convert int16 window to float32
+    for (int s = 0; s + WIN_LENGTH <= n_samples; s += HOP_LENGTH) {
         float win_f[WIN_LENGTH];
         for (int i = 0; i < WIN_LENGTH; i++)
-            win_f[i] = pcm_buf[start + i] / 32768.0f;
+            win_f[i] = pcm_buf[s + i] / 32768.0f;
 
-        compute_frame_mfcc(win_f, frame_mfcc);
+        compute_frame_mel_raw(win_f, mel_e);
 
+        // Spectral subtraction + log compression
+        for (int m = 0; m < N_MELS; m++) {
+            mel_e[m] -= noise_floor[m];
+            if (mel_e[m] < 1e-9f) mel_e[m] = 1e-9f;  // floor before log
+            mel_e[m] = log10f(mel_e[m]);
+        }
+
+        // DCT-II → accumulate mean and variance
         for (int c = 0; c < N_MFCC; c++) {
-            mfcc_sum[c] += frame_mfcc[c];
-            mfcc_sq[c]  += frame_mfcc[c] * frame_mfcc[c];
+            float coeff = dct_ortho(mel_e, N_MELS, c);
+            mfcc_sum[c] += coeff;
+            mfcc_sq[c]  += coeff * coeff;
         }
         n_frames++;
     }
 
-    // Build JSON response
-    StaticJsonDocument<1024> doc;
+    // ── Build JSON response ───────────────────────────────────────────────
+    StaticJsonDocument<1536> doc;
     if (n_frames == 0) {
         doc["ok"]    = false;
         doc["error"] = "no frames";
@@ -230,6 +299,7 @@ static void process_audio(int n_samples) {
         doc["ok"]     = true;
         doc["frames"] = n_frames;
         doc["rms"]    = rms;
+        doc["snr_db"] = snr_db;
         JsonArray mean_arr = doc.createNestedArray("mfcc_mean");
         JsonArray var_arr  = doc.createNestedArray("mfcc_var");
         for (int c = 0; c < N_MFCC; c++) {

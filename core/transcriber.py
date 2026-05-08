@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import wave
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 from faster_whisper import WhisperModel
@@ -34,18 +34,134 @@ _MODEL_CACHE: dict = {}
 
 SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 DEFAULT_MODEL    = "small"
+
+
+def _detect_device() -> Tuple[str, str]:
+    """
+    Auto-detect the best available compute device.
+
+    Returns:
+        (device, compute_type) tuple:
+          - ("cuda", "float16") when an NVIDIA GPU with cuBLAS/cuDNN is available.
+          - ("cpu",  "int8")   as a safe fallback.
+    """
+    try:
+        import ctranslate2  # faster-whisper depends on this
+        # ctranslate2 exposes get_supported_compute_types which raises if CUDA
+        # libs (cuBLAS/cuDNN) are not installed, making it a reliable probe.
+        cuda_types = ctranslate2.get_supported_compute_types("cuda")
+        if cuda_types:  # non-empty list means CUDA is usable
+            return "cuda", "float16"
+    except Exception:
+        pass
+    return "cpu", "int8"
+
+
 CLIP_PADDING_S   = 0.1   # 100 ms padding on each side for fingerprinting
+
+# ── Curated Indic fine-tuned models (verified CTranslate2 format) ────────────
+# All entries below are VERIFIED: repo exists on HuggingFace, is public,
+# and contains model.bin (CTranslate2 format that faster-whisper can load).
+#
+# IMPORTANT — vasista22/* models are NOT listed here.
+# vasista22 publishes excellent Tamil/Telugu/Hindi fine-tunes but in PyTorch
+# (Transformers) format only.  To use them you must convert locally first:
+#
+#   pip install ctranslate2 transformers
+#   ct2-transformers-converter \
+#       --model vasista22/whisper-tamil-medium \
+#       --output_dir ./faster-whisper-tamil-medium \
+#       --quantization int8
+#
+# Then enter the local path in the "Custom model" text field in the UI.
+#
+# Display name  →  HuggingFace repo ID (or local CTranslate2 directory path)
+INDIC_MODELS: dict = {
+    # ── Tamil ────────────────────────────────────────────────────────────────
+    # Fine-tuned whisper-medium converted to CTranslate2 int8 by sathish-93.
+    "Tamil · medium int8  (sathish-93)":         "sathish-93/whisper-tamil-medium-ct2-int8",
+
+    # ── Hindi ─────────────────────────────────────────────────────────────────
+    # Collabora official conversions — best maintained Hindi models available.
+    "Hindi · medium  (collabora)":               "collabora/faster-whisper-medium-hindi",
+    "Hindi · large-v2  (collabora)":             "collabora/faster-whisper-large-v2-hindi",
+    "Hindi · small  (collabora)":                "collabora/faster-whisper-small-hindi",
+
+    # ── Malayalam ────────────────────────────────────────────────────────────
+    # LoRA-merged whisper-large-v3 fine-tune, converted to CTranslate2.
+    "Malayalam · large-v3  (BettySara)":         "BettySara/betty-whisper-large-v3-malayalam-ct2",
+
+    # ── Kannada ──────────────────────────────────────────────────────────────
+    # Only publicly available Kannada CTranslate2 model — tiny size.
+    # Low accuracy due to model size; convert vasista22/whisper-kannada-medium
+    # locally (see instructions above) for better results.
+    "Kannada · tiny  (elprofessor67 — low acc)": "elprofessor67/faster-whisper-kannada-tiny",
+
+    # ── Telugu ───────────────────────────────────────────────────────────────
+    # large-v2 based; name suggests bilingual Telugu+English subtitle model.
+    # Test on your audio before committing to this for production use.
+    "Telugu · large-v2  (cvas-544 — test first)":"cvas-544/autotinglishsub-whisper-telugu-ct2",
+
+    # ── Indic multilingual ───────────────────────────────────────────────────
+    # Medium-sized model covering all 99 Whisper languages incl. all 5 above.
+    # Use when you need a single model for mixed-language content.
+    "Indic multilingual · medium  (Superleap)":  "Superleap/faster_indic_whisper_nodcil",
+
+    # ── Fallback: best general-purpose option ────────────────────────────────
+    "OpenAI large-v3  (best general, no Indic fine-tune)": "large-v3",
+}
 
 
 def load_model(model_size: str = DEFAULT_MODEL) -> WhisperModel:
     """
     Load (or return cached) Faster-Whisper model.
-    CPU-only, INT8 quantisation for minimal RAM usage.
+
+    ``model_size`` can be:
+      - A standard size name: "tiny", "base", "small", "medium",
+        "large-v2", "large-v3"
+      - A HuggingFace repo ID for a CTranslate2-format model, e.g.
+        "sathish-93/whisper-tamil-medium-ct2-int8"
+      - An absolute path to a local CTranslate2 model directory, e.g.
+        "C:/models/faster-whisper-tamil-medium"
+
+    The model MUST be in CTranslate2 format (contains model.bin).
+    Standard Transformers/PyTorch models (pytorch_model.bin) will fail.
+    Convert with: ct2-transformers-converter --model <hf-repo> --output_dir <dir> --quantization int8
+
+    The model is cached by its name/path so subsequent calls within
+    the same Streamlit session skip the download/load overhead.
+
+    Raises:
+        RuntimeError: wraps HuggingFace download errors (404, 401, wrong format)
+                      with a human-readable message.
     """
     if model_size not in _MODEL_CACHE:
-        _MODEL_CACHE[model_size] = WhisperModel(
-            model_size, device="cpu", compute_type="int8"
-        )
+        try:
+            device, compute_type = _detect_device()
+            _MODEL_CACHE[model_size] = WhisperModel(
+                model_size, device=device, compute_type=compute_type
+            )
+        except Exception as exc:
+            msg = str(exc)
+            # Surface common mistakes with a clear explanation
+            if "401" in msg or "Invalid username" in msg or "authentication" in msg.lower():
+                raise RuntimeError(
+                    f"Model not found or not public on HuggingFace: '{model_size}'.\n\n"
+                    "Common causes:\n"
+                    "  1. The repo ID is wrong — double-check spelling on huggingface.co\n"
+                    "  2. The model is private — you need a HF token (not supported yet)\n"
+                    "  3. The model is PyTorch format, not CTranslate2 — it needs conversion:\n"
+                    f"     ct2-transformers-converter --model {model_size} "
+                    f"--output_dir ./my-ct2-model --quantization int8\n"
+                    "  4. For vasista22/* models: they are PyTorch only — convert locally,\n"
+                    "     then enter the local folder path in the Custom Model field."
+                ) from exc
+            if "404" in msg or "Repository Not Found" in msg:
+                raise RuntimeError(
+                    f"HuggingFace repository '{model_size}' does not exist.\n"
+                    "Check the repo ID at https://huggingface.co/models"
+                ) from exc
+            raise RuntimeError(f"Failed to load model '{model_size}': {exc}") from exc
     return _MODEL_CACHE[model_size]
 
 

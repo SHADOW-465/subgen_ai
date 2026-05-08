@@ -32,9 +32,13 @@ FMIN        = 0.0
 FMAX        = 8000.0
 
 # Serial Protocol
-BAUD_RATE = 460800
+# 2 Mbps: 64 KB audio transfers in ~0.32 s vs ~1.39 s at 460800.
+# Requires CH340/CH341 USB-serial bridge (most common on cheap ESP32 DevKit v1
+# boards from AliExpress/Robu/Amazon India).  CP2102-based boards top out at
+# ~921600 — change this constant to 921600 if you have a CP2102 board.
+BAUD_RATE = 2_000_000
 HEADER    = bytes([0xAA, 0x55])
-TIMEOUT_S = 3.0
+TIMEOUT_S = 2.0   # reduced from 3.0 — transfer+process at 2 Mbps is ~0.52 s
 
 # Cached Mel Filterbank
 _MEL_FILTERBANK: Optional[np.ndarray] = None
@@ -81,63 +85,108 @@ def get_filterbank() -> np.ndarray:
 
 def compute_mfcc_software(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict:
     """
-    Compute MFCC fingerprint using the same algorithm as the ESP32 firmware.
+    Compute MFCC fingerprint using two-pass spectral subtraction — identical
+    to the ESP32 two-pass firmware algorithm.
 
-    Steps: Hanning window → 512-pt FFT → power spectrum → 26-band mel filterbank
-           → log compression → DCT-II → 12 MFCC coefficients per frame
-           → mean and variance across all frames.
+    Pass 1: iterate all analysis frames; compute raw (pre-log) mel filterbank
+            energies; classify each frame as noise (RMS < RMS_SILENCE) or
+            speech; accumulate a per-band noise floor from noise frames;
+            compute mel-domain SNR.
+
+    Pass 2: iterate all frames again; subtract the noise floor from raw mel
+            energies before log compression and DCT-II; accumulate MFCC mean
+            and variance.
+
+    Spectral subtraction in the mel domain (before log) is correct because
+    log is a non-linear operation — subtracting after log does not equal
+    subtracting the noise energy.
 
     Args:
         audio: float32 array, normalised [-1, 1] or int16 range.
-        sr: sample rate (default 16000 Hz).
+        sr:    sample rate (default 16000 Hz).
 
     Returns:
-        dict with keys: ok (bool), hw (bool), mfcc_mean (list[float]),
-                        mfcc_var (list[float]), rms (float), frames (int).
+        dict with keys: ok, hw, mfcc_mean, mfcc_var, rms, snr_db, frames.
     """
+    # Frames below this normalised RMS are treated as noise frames.
+    # Must match RMS_SILENCE in the ESP32 firmware.
+    RMS_SILENCE = 0.002
+
     if len(audio) == 0:
         return {"ok": False, "hw": False,
                 "mfcc_mean": [0.0] * N_MFCC, "mfcc_var": [0.0] * N_MFCC,
-                "rms": 0.0, "frames": 0}
+                "rms": 0.0, "snr_db": -20.0, "frames": 0}
 
-    # Normalise: detect int16 range
+    # Normalise to [-1, 1]
     audio = audio.astype(np.float32)
     if np.max(np.abs(audio)) > 1.0:
         audio = audio / 32768.0
 
     rms        = float(np.sqrt(np.mean(audio ** 2)))
     filterbank = get_filterbank()
-    coefficients_per_frame: list = []
+
+    # ── Pass 1: collect raw mel energies and classify frames ─────────────────
+    raw_mel_all:    list = []   # raw (pre-log) mel energy vector per frame
+    frame_rms_all:  list = []   # per-frame RMS
 
     for start in range(0, len(audio) - WIN_LENGTH, HOP_LENGTH):
-        frame = audio[start:start + WIN_LENGTH]
+        frame     = audio[start:start + WIN_LENGTH]
+        frame_rms = float(np.sqrt(np.mean(frame ** 2)))
+        frame_rms_all.append(frame_rms)
 
-        # Hanning window (matches ESP32 firmware)
-        window          = np.hanning(len(frame))
-        frame_windowed  = frame * window
-
-        # Zero-pad to N_FFT
+        # Hanning window + zero-pad to N_FFT
         padded          = np.zeros(N_FFT, dtype=np.float32)
-        padded[:len(frame_windowed)] = frame_windowed
+        padded[:WIN_LENGTH] = frame * np.hanning(WIN_LENGTH)
 
-        # FFT power spectrum
-        spectrum = np.fft.rfft(padded)
-        power    = (np.abs(spectrum) ** 2) / N_FFT
+        # FFT power spectrum (matches ESP32: |X|² / N_FFT)
+        power = (np.abs(np.fft.rfft(padded)) ** 2) / N_FFT
 
-        # Mel filterbank energies
-        mel_energies = np.dot(filterbank, power)
+        # Raw mel energies — log compression is NOT applied here
+        raw_mel_all.append(np.dot(filterbank, power))
 
-        # Log compression
-        log_mel = np.log10(mel_energies + 1e-9)
-
-        # DCT-II → first 12 coefficients
-        cepstrum = dct(log_mel, type=2, norm='ortho')
-        coefficients_per_frame.append(cepstrum[:N_MFCC])
-
-    if not coefficients_per_frame:
+    if not raw_mel_all:
         return {"ok": False, "hw": False,
                 "mfcc_mean": [0.0] * N_MFCC, "mfcc_var": [0.0] * N_MFCC,
-                "rms": rms, "frames": 0}
+                "rms": rms, "snr_db": -20.0, "frames": 0}
+
+    # ── Separate noise / speech frames ───────────────────────────────────────
+    noise_mel  = [m for m, r in zip(raw_mel_all, frame_rms_all)
+                  if r <  RMS_SILENCE]
+    speech_mel = [m for m, r in zip(raw_mel_all, frame_rms_all)
+                  if r >= RMS_SILENCE]
+
+    # Per-band noise floor: mean of noise-frame mel energies.
+    # All-zero if no silence detected (clean recording → no subtraction).
+    noise_floor: np.ndarray = (
+        np.mean(noise_mel, axis=0) if noise_mel
+        else np.zeros(N_MELS, dtype=np.float32)
+    )
+
+    # ── Mel-domain SNR ────────────────────────────────────────────────────────
+    if speech_mel and noise_mel:
+        mean_speech_mel = float(np.mean([np.mean(f) for f in speech_mel]))
+        mean_noise_mel  = max(float(np.mean([np.mean(f) for f in noise_mel])), 1e-10)
+        snr_db = float(np.clip(
+            10.0 * np.log10(mean_speech_mel / mean_noise_mel), -20.0, 60.0
+        ))
+    elif speech_mel:
+        snr_db = 60.0   # clean recording — no detected noise floor
+    else:
+        snr_db = -20.0  # all noise / empty clip
+
+    # ── Pass 2: spectral subtraction → log → DCT-II ──────────────────────────
+    coefficients_per_frame: list = []
+
+    for mel_e in raw_mel_all:
+        # Subtract noise floor; floor residual at epsilon before log
+        denoised = np.maximum(mel_e - noise_floor, 1e-9)
+
+        # Log compression on denoised energies (not raw)
+        log_mel = np.log10(denoised)
+
+        # DCT-II with ortho normalisation → first 12 coefficients
+        cepstrum = dct(log_mel, type=2, norm='ortho')
+        coefficients_per_frame.append(cepstrum[:N_MFCC])
 
     frames_arr = np.array(coefficients_per_frame)
     mfcc_mean  = frames_arr.mean(axis=0).tolist()
@@ -146,7 +195,8 @@ def compute_mfcc_software(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict:
     return {
         "ok": True, "hw": False,
         "mfcc_mean": mfcc_mean, "mfcc_var": mfcc_var,
-        "rms": rms, "frames": len(coefficients_per_frame)
+        "rms": rms, "snr_db": snr_db,
+        "frames": len(coefficients_per_frame),
     }
 
 
